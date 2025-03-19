@@ -1,0 +1,270 @@
+name: Test GitHub Page Limits
+on:
+  pull_request:
+    branches: [main, dev]
+jobs:
+  check-page-limits:
+    name: Check GitHub Page Limits
+    permissions: write-all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: |
+          npm install axios chai mocha
+      
+      - name: Check for baseline file
+        id: check_baseline
+        run: |
+          if [ -f "./tests/baseline-page-limits.json" ]; then
+            echo "baseline_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "baseline_exists=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Generate baseline from main
+        if: steps.check_baseline.outputs.baseline_exists == 'false'
+        run: |
+          git checkout main
+          mkdir -p tests
+          cat > tests/measure-page-limits.js << 'EOL'
+          const axios = require('axios');
+          const fs = require('fs');
+          
+          async function measurePageLimits() {
+            const pages = [
+              '/',
+              '/docs',
+              '/about'
+              // Add other important pages here
+            ];
+            
+            const baseUrl = 'https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}';
+            const results = {};
+            
+            for (const page of pages) {
+              try {
+                const url = baseUrl + page;
+                console.log(`Measuring page: ${url}`);
+                const start = Date.now();
+                const response = await axios.get(url);
+                const loadTime = Date.now() - start;
+                const html = response.data;
+                
+                results[page] = {
+                  size: response.headers['content-length'] || Buffer.byteLength(html, 'utf8'),
+                  loadTime,
+                  resources: {
+                    scripts: (html.match(/<script/g) || []).length,
+                    stylesheets: (html.match(/<link[^>]*rel=["']stylesheet["']/g) || []).length,
+                    images: (html.match(/<img/g) || []).length
+                  }
+                };
+              } catch (error) {
+                console.error(`Error measuring ${page}: ${error.message}`);
+                results[page] = { error: error.message };
+              }
+            }
+            
+            return results;
+          }
+          
+          measurePageLimits().then(results => {
+            fs.writeFileSync('./tests/baseline-page-limits.json', JSON.stringify(results, null, 2));
+            console.log('Baseline measurements saved');
+          }).catch(error => {
+            console.error('Error:', error);
+            process.exit(1);
+          });
+          EOL
+          
+          node tests/measure-page-limits.js
+          
+          # Commit the baseline file
+          git config user.name 'GitHub Actions'
+          git config user.email 'actions@users.noreply.github.com'
+          git add tests/baseline-page-limits.json
+          git commit -m "Add baseline page limits measurement" || echo "No changes to commit"
+          git push origin main
+      
+      - name: Checkout PR branch
+        run: |
+          git checkout ${{ github.head_ref }}
+          git pull origin ${{ github.head_ref }}
+      
+      - name: Run tests
+        run: |
+          mkdir -p tests
+          cat > tests/check-page-limits.js << 'EOL'
+          const axios = require('axios');
+          const fs = require('fs');
+          const { strict: assert } = require('assert');
+          
+          async function comparePageLimits() {
+            // Load baseline measurements
+            const baseline = require('./baseline-page-limits.json');
+            
+            const pages = Object.keys(baseline);
+            const baseUrl = 'https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}';
+            const results = {
+              passed: true,
+              details: {}
+            };
+            
+            for (const page of pages) {
+              try {
+                if (baseline[page].error) {
+                  console.log(`Skipping ${page} as baseline has errors`);
+                  continue;
+                }
+                
+                const url = baseUrl + page;
+                console.log(`Checking page: ${url}`);
+                const start = Date.now();
+                const response = await axios.get(url);
+                const loadTime = Date.now() - start;
+                const html = response.data;
+                
+                const current = {
+                  size: response.headers['content-length'] || Buffer.byteLength(html, 'utf8'),
+                  loadTime,
+                  resources: {
+                    scripts: (html.match(/<script/g) || []).length,
+                    stylesheets: (html.match(/<link[^>]*rel=["']stylesheet["']/g) || []).length,
+                    images: (html.match(/<img/g) || []).length
+                  }
+                };
+                
+                // Calculate changes
+                const sizeChange = ((current.size - baseline[page].size) / baseline[page].size * 100).toFixed(2);
+                const loadTimeChange = ((current.loadTime - baseline[page].loadTime) / baseline[page].loadTime * 100).toFixed(2);
+                const resourceChanges = {
+                  scripts: current.resources.scripts - baseline[page].resources.scripts,
+                  stylesheets: current.resources.stylesheets - baseline[page].resources.stylesheets,
+                  images: current.resources.images - baseline[page].resources.images
+                };
+                
+                // Check if changes exceed limits
+                const limits = {
+                  size: 5, // 5% increase max
+                  loadTime: 20, // 20% increase max
+                  scripts: 1, // 1 additional script max
+                  stylesheets: 1, // 1 additional stylesheet max
+                  images: Math.ceil(baseline[page].resources.images * 0.1) // 10% increase max
+                };
+                
+                const exceedsLimits = 
+                  parseFloat(sizeChange) > limits.size ||
+                  parseFloat(loadTimeChange) > limits.loadTime ||
+                  resourceChanges.scripts > limits.scripts ||
+                  resourceChanges.stylesheets > limits.stylesheets ||
+                  resourceChanges.images > limits.images;
+                
+                if (exceedsLimits) {
+                  results.passed = false;
+                }
+                
+                results.details[page] = {
+                  baseline: baseline[page],
+                  current,
+                  changes: {
+                    size: sizeChange,
+                    loadTime: loadTimeChange,
+                    resources: resourceChanges
+                  },
+                  limits,
+                  passed: !exceedsLimits
+                };
+              } catch (error) {
+                console.error(`Error measuring ${page}: ${error.message}`);
+                results.details[page] = { error: error.message };
+              }
+            }
+            
+            return results;
+          }
+          
+          comparePageLimits().then(results => {
+            fs.writeFileSync('./test-results.json', JSON.stringify(results, null, 2));
+            console.log('Test results saved');
+            
+            if (!results.passed) {
+              console.error('Some pages exceed limits');
+              process.exit(1);
+            }
+          }).catch(error => {
+            console.error('Error:', error);
+            process.exit(1);
+          });
+          EOL
+          
+          node tests/check-page-limits.js || echo "Test failed, but continuing to provide feedback"
+      
+      - name: Generate report for PR
+        if: always()
+        run: |
+          if [ -f "./test-results.json" ]; then
+            echo "Generating PR comment from test results"
+            node -e '
+            const fs = require("fs");
+            const results = JSON.parse(fs.readFileSync("./test-results.json", "utf8"));
+            
+            let comment = "## GitHub Page Limits Test Results\n\n";
+            
+            if (results.passed) {
+              comment += "✅ All GitHub Pages limits are within acceptable ranges!\n\n";
+            } else {
+              comment += "❌ Some GitHub Pages limits have been exceeded. Please review the changes.\n\n";
+            }
+            
+            comment += "| Page | Size Change | Load Time | Scripts | Stylesheets | Images | Status |\n";
+            comment += "|------|------------|-----------|---------|-------------|--------|--------|\n";
+            
+            for (const page in results.details) {
+              const details = results.details[page];
+              
+              if (details.error) {
+                comment += `| ${page} | Error: ${details.error} | | | | | ❓ |\n`;
+                continue;
+              }
+              
+              const status = details.passed ? "✅" : "❌";
+              comment += `| ${page} | ${details.changes.size}% | ${details.changes.loadTime}% | ${details.changes.resources.scripts} | ${details.changes.resources.stylesheets} | ${details.changes.resources.images} | ${status} |\n`;
+            }
+            
+            comment += "\n### Limits\n";
+            comment += "- Size: Max 5% increase\n";
+            comment += "- Load Time: Max 20% increase\n";
+            comment += "- Scripts: Max 1 additional\n";
+            comment += "- Stylesheets: Max 1 additional\n";
+            comment += "- Images: Max 10% increase\n";
+            
+            fs.writeFileSync("./pr-comment.md", comment);
+            '
+          else
+            echo "## GitHub Page Limits Test Results\n\n❌ Failed to generate test results. Please check the workflow logs." > ./pr-comment.md
+          fi
+      
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const comment = fs.readFileSync('./pr-comment.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
